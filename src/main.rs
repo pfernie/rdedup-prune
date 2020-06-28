@@ -3,6 +3,7 @@
 use std::{env, result::Result as StdResult};
 
 use anyhow::anyhow;
+use chrono;
 use rdedup_lib;
 use slog::{self, info, o, Drain};
 use slog_async;
@@ -23,6 +24,9 @@ struct Opt {
     #[structopt(short = "p", long = "prefix")]
     /// The prefix string for names to be pruned
     prefix: String,
+    #[structopt(long = "no-prompt")]
+    /// Do not prompt for confirmation prior to pruning entries
+    no_prompt: bool,
     #[structopt(short = "n", long = "dry-run")]
     /// Dry-run only; do not prune any names
     dry_run: bool,
@@ -95,8 +99,23 @@ fn create_logger(verbosity: u32, timing_verbosity: u32) -> slog::Logger {
     }
 }
 
+fn parse_timestamp(prefix_len: usize, name: String) -> (Option<chrono::NaiveDateTime>, String) {
+    let timestamp =
+        chrono::NaiveDateTime::parse_from_str(&name[prefix_len..], "%Y-%m-%d-%H-%M-%S").ok();
+    (timestamp, name)
+}
+
 fn main() -> Result<()> {
     let opts = Opt::from_args();
+
+    if opts.keep_hourly.is_none()
+        && opts.keep_daily.is_none()
+        && opts.keep_weekly.is_none()
+        && opts.keep_monthly.is_none()
+        && opts.keep_yearly.is_none()
+    {
+        Err(anyhow!("No retention rules specified. At least one of --keep-{hourly,daily,weekly,monthly,yearly} must be specified, or all names would be pruned."))?;
+    }
 
     let log = create_logger(opts.verbose, opts.verbose_timings);
 
@@ -120,8 +139,17 @@ fn main() -> Result<()> {
 
     let repo = rdedup_lib::Repo::open(&url, log)?;
 
-    for name in repo.list_names()? {
-        println!("{}", name);
+    let parse_timestamp = |n| parse_timestamp(opts.prefix.len(), n);
+
+    let names = repo
+        .list_names()?
+        .into_iter()
+        .filter(|n| n.starts_with(&opts.prefix))
+        .map(parse_timestamp)
+        .collect::<Vec<_>>();
+
+    for (timestamp, name) in &names {
+        println!("{}: {:?}", name, timestamp);
     }
 
     Ok(())
