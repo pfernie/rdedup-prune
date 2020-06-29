@@ -1,6 +1,6 @@
 #![deny(warnings, missing_debug_implementations, rust_2018_idioms)]
 
-use std::{collections::HashSet, env, result::Result as StdResult};
+use std::{collections::HashSet, env, io::Write, result::Result as StdResult};
 
 use anyhow::anyhow;
 use chrono::{Datelike, NaiveDateTime};
@@ -394,6 +394,7 @@ fn main() -> Result<()> {
 
     if !opts.no_prompt {
         print!("Remove names [yN]? ");
+        std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.to_lowercase().starts_with("y") {
@@ -404,6 +405,7 @@ fn main() -> Result<()> {
 
     for (name, _) in to_remove {
         print!("Removing {}...", name);
+        std::io::stdout().flush()?;
         repo.rm(&name)?;
         println!("done");
     }
