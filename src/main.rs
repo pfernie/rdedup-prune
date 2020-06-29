@@ -58,6 +58,9 @@ struct Opt {
     #[structopt(short = "y", long = "keep-yearly", default_value = "0")]
     /// Number of yearly archives to keep
     keep_yearly: i32,
+    #[structopt(long = "gc-grace", default_value = "86400")]
+    /// Set grace time in seconds for `gc` command
+    gc_grace_secs: u64,
 }
 
 type Error = anyhow::Error;
@@ -368,29 +371,48 @@ fn main() -> Result<()> {
         .map(|n| parse_timestamp(prefix_len, &opts.timestamp_format, n))
         .collect::<Vec<_>>();
 
-    for ts_name in &names {
-        match ts_name {
-            (name, None) => println!("{} does not contain a parseable timestamp, ignoring", name),
-            (name, Some(timestamp)) => {
-                println!("{}: {:?}", name, timestamp);
-            }
-        }
-    }
-
     let actions = prune(keep, &names[..]);
 
-    let mut has_removals = false;
-    for (name, action) in actions {
+    for (name, action) in &actions {
         println!("{}: {:?}", name, action);
-        if let Action::Remove = action {
-            has_removals = true;
+    }
+
+    let to_remove = actions
+        .into_iter()
+        .filter(|(_, a)| a == &Action::Remove)
+        .collect::<Vec<_>>();
+
+    if to_remove.is_empty() {
+        println!("No names need pruning.");
+        return Ok(());
+    }
+
+    if opts.dry_run {
+        println!("--dry-run specified, no action taken.");
+        return Ok(());
+    }
+
+    if !opts.no_prompt {
+        print!("Remove names [yN]? ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.to_lowercase().starts_with("y") {
+            println!("\nAborting.");
+            return Ok(());
         }
     }
 
-    if !opts.skip_gc && has_removals {
-        println!("would GC now");
+    for (name, _) in to_remove {
+        print!("Removing {}...", name);
+        repo.rm(&name)?;
+        println!("done");
+    }
+
+    if !opts.skip_gc {
+        println!("Running GC.");
+        repo.gc(opts.gc_grace_secs)?;
     } else {
-        println!("no GC needed");
+        println!("GC skipped.");
     }
 
     Ok(())
