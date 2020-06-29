@@ -398,7 +398,7 @@ fn main() -> Result<()> {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.to_lowercase().starts_with("y") {
-            println!("\nAborting.");
+            println!("Aborting.");
             return Ok(());
         }
     }
@@ -411,10 +411,11 @@ fn main() -> Result<()> {
     }
 
     if !opts.skip_gc {
-        println!("Running GC.");
+        print!("Running GC...");
         repo.gc(opts.gc_grace_secs)?;
+        println!("done");
     } else {
-        println!("GC skipped.");
+        println!("--skip-gc specified, skipping GC.");
     }
 
     Ok(())
