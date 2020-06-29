@@ -1,19 +1,21 @@
 #![deny(warnings, missing_debug_implementations, rust_2018_idioms)]
 
-use std::{env, result::Result as StdResult};
+use std::{collections::HashSet, env, result::Result as StdResult};
 
 use anyhow::anyhow;
-use chrono;
-use rdedup_lib;
+use chrono::{Datelike, NaiveDateTime};
 use slog::{self, info, o, Drain};
-use slog_async;
-use slog_term;
 use structopt::StructOpt;
-use url;
+
+const DEFAULT_TIMESTAMP_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
 
 #[derive(Debug, StructOpt)]
 /// Prunes `rdedup` names that do not match the given criteria. Names must be in a format matching
-/// `<prefix><timestamp>` where timestamp is formatted as yyyy-mm-dd-HH-MM-SS.
+/// `<prefix><timestamp>` where timestamp is formatted as yyyy-mm-dd-HH-MM-SS. Alternate timestamp
+/// formats may be specified with the --timestamp-format option.
+/// Specifying a negative value for any --keep-* directive will result in an unlimited number for
+/// that category. Specifying 0 disables the directive (the same as not specifying the directive at
+/// all).
 struct Opt {
     #[structopt(parse(from_occurrences), short = "v", long = "verbose")]
     /// Increase debugging level for general messages
@@ -21,30 +23,41 @@ struct Opt {
     #[structopt(parse(from_occurrences), short = "t", long = "verbose-timings")]
     /// Increase debugging level for timing messages
     verbose_timings: u32,
+    #[structopt(
+        short = "f",
+        long = "timestamp-format",
+        default_value = DEFAULT_TIMESTAMP_FORMAT
+    )]
+    /// Specify an alternate timestamp format string. Note that the timestamp format should be
+    /// granular enough to satisfy the --keep-* directives specified.
+    timestamp_format: String,
     #[structopt(short = "p", long = "prefix")]
     /// The prefix string for names to be pruned
     prefix: String,
     #[structopt(long = "no-prompt")]
     /// Do not prompt for confirmation prior to pruning entries
     no_prompt: bool,
+    #[structopt(long = "skip-gc")]
+    /// Do not perform a `gc` after names are removed
+    skip_gc: bool,
     #[structopt(short = "n", long = "dry-run")]
     /// Dry-run only; do not prune any names
     dry_run: bool,
-    #[structopt(short = "H", long = "keep-hourly")]
+    #[structopt(short = "H", long = "keep-hourly", default_value = "0")]
     /// Number of hourly archives to keep
-    keep_hourly: Option<i32>,
-    #[structopt(short = "d", long = "keep-daily")]
+    keep_hourly: i32,
+    #[structopt(short = "d", long = "keep-daily", default_value = "0")]
     /// Number of daily archives to keep
-    keep_daily: Option<i32>,
-    #[structopt(short = "w", long = "keep-weekly")]
+    keep_daily: i32,
+    #[structopt(short = "w", long = "keep-weekly", default_value = "0")]
     /// Number of weekly archives to keep
-    keep_weekly: Option<i32>,
-    #[structopt(short = "m", long = "keep-monthly")]
+    keep_weekly: i32,
+    #[structopt(short = "m", long = "keep-monthly", default_value = "0")]
     /// Number of monthly archives to keep
-    keep_monthly: Option<i32>,
-    #[structopt(short = "y", long = "keep-yearly")]
+    keep_monthly: i32,
+    #[structopt(short = "y", long = "keep-yearly", default_value = "0")]
     /// Number of yearly archives to keep
-    keep_yearly: Option<i32>,
+    keep_yearly: i32,
 }
 
 type Error = anyhow::Error;
@@ -99,58 +112,1145 @@ fn create_logger(verbosity: u32, timing_verbosity: u32) -> slog::Logger {
     }
 }
 
-fn parse_timestamp(prefix_len: usize, name: String) -> (Option<chrono::NaiveDateTime>, String) {
-    let timestamp =
-        chrono::NaiveDateTime::parse_from_str(&name[prefix_len..], "%Y-%m-%d-%H-%M-%S").ok();
-    (timestamp, name)
+fn parse_timestamp(
+    prefix_len: usize,
+    timestamp_format: &str,
+    name: String,
+) -> (String, Option<NaiveDateTime>) {
+    if prefix_len > name.len() {
+        return (name, None);
+    }
+
+    let timestamp = NaiveDateTime::parse_from_str(&name[prefix_len..], timestamp_format).ok();
+    (name, timestamp)
+}
+
+#[derive(Debug, PartialEq)]
+enum RetainedBy {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+#[derive(Debug, PartialEq)]
+enum Action {
+    Retain(RetainedBy),
+    Remove,
+    Ignore,
+}
+
+#[derive(Debug)]
+enum RetentionCount {
+    Count(u32),
+    Unlimited,
+}
+
+impl RetentionCount {
+    fn from_i32(count: i32) -> RetentionCount {
+        if count < 0 {
+            RetentionCount::Unlimited
+        } else {
+            RetentionCount::Count(count as u32)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            RetentionCount::Count(0) => true,
+            _ => false,
+        }
+    }
+}
+
+struct RetentionCounts {
+    hourly: RetentionCount,
+    daily: RetentionCount,
+    weekly: RetentionCount,
+    monthly: RetentionCount,
+    yearly: RetentionCount,
+}
+
+impl RetentionCounts {
+    fn from_opts(opts: &Opt) -> RetentionCounts {
+        let hourly = RetentionCount::from_i32(opts.keep_hourly);
+        let daily = RetentionCount::from_i32(opts.keep_daily);
+        let weekly = RetentionCount::from_i32(opts.keep_weekly);
+        let monthly = RetentionCount::from_i32(opts.keep_monthly);
+        let yearly = RetentionCount::from_i32(opts.keep_yearly);
+        RetentionCounts {
+            hourly,
+            daily,
+            weekly,
+            monthly,
+            yearly,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hourly.is_empty()
+            && self.daily.is_empty()
+            && self.weekly.is_empty()
+            && self.monthly.is_empty()
+            && self.yearly.is_empty()
+    }
+
+    fn allow_more_hourly(&self, count: usize) -> bool {
+        match self.hourly {
+            RetentionCount::Count(c) => c as usize > count,
+            RetentionCount::Unlimited => true,
+        }
+    }
+
+    fn allow_more_daily(&self, count: usize) -> bool {
+        match self.daily {
+            RetentionCount::Count(c) => c as usize > count,
+            RetentionCount::Unlimited => true,
+        }
+    }
+
+    fn allow_more_weekly(&self, count: usize) -> bool {
+        match self.weekly {
+            RetentionCount::Count(c) => c as usize > count,
+            RetentionCount::Unlimited => true,
+        }
+    }
+
+    fn allow_more_monthly(&self, count: usize) -> bool {
+        match self.monthly {
+            RetentionCount::Count(c) => c as usize > count,
+            RetentionCount::Unlimited => true,
+        }
+    }
+
+    fn allow_more_yearly(&self, count: usize) -> bool {
+        match self.yearly {
+            RetentionCount::Count(c) => c as usize > count,
+            RetentionCount::Unlimited => true,
+        }
+    }
+}
+
+struct RetentionBins {
+    retention_counts: RetentionCounts,
+    hourly_bins: HashSet<String>,
+    daily_bins: HashSet<String>,
+    weekly_bins: HashSet<String>,
+    monthly_bins: HashSet<String>,
+    yearly_bins: HashSet<i32>,
+}
+
+impl RetentionBins {
+    fn new(retention_counts: RetentionCounts) -> RetentionBins {
+        RetentionBins {
+            retention_counts,
+            hourly_bins: HashSet::new(),
+            daily_bins: HashSet::new(),
+            weekly_bins: HashSet::new(),
+            monthly_bins: HashSet::new(),
+            yearly_bins: HashSet::new(),
+        }
+    }
+
+    fn can_retain(&mut self, timestamp: NaiveDateTime) -> Action {
+        let hourly_key = timestamp.format("%Y%m%d%H").to_string();
+        if self
+            .retention_counts
+            .allow_more_hourly(self.hourly_bins.len())
+            && !self.hourly_bins.contains(&hourly_key)
+        {
+            self.hourly_bins.insert(hourly_key);
+            return Action::Retain(RetainedBy::Hourly);
+        }
+
+        let daily_key = timestamp.format("%Y%m%d").to_string();
+        if self
+            .retention_counts
+            .allow_more_daily(self.daily_bins.len())
+            && !self.daily_bins.contains(&daily_key)
+        {
+            self.daily_bins.insert(daily_key);
+            return Action::Retain(RetainedBy::Daily);
+        }
+
+        let weekly_key = timestamp.format("%Y%W").to_string();
+        if self
+            .retention_counts
+            .allow_more_weekly(self.weekly_bins.len())
+            && !self.weekly_bins.contains(&weekly_key)
+        {
+            self.weekly_bins.insert(weekly_key);
+            return Action::Retain(RetainedBy::Weekly);
+        }
+
+        let monthly_key = timestamp.format("%Y%m").to_string();
+        if self
+            .retention_counts
+            .allow_more_monthly(self.monthly_bins.len())
+            && !self.monthly_bins.contains(&monthly_key)
+        {
+            self.monthly_bins.insert(monthly_key);
+            return Action::Retain(RetainedBy::Monthly);
+        }
+
+        let yearly_key = timestamp.year();
+        if self
+            .retention_counts
+            .allow_more_yearly(self.yearly_bins.len())
+            && !self.yearly_bins.contains(&yearly_key)
+        {
+            self.yearly_bins.insert(yearly_key);
+            return Action::Retain(RetainedBy::Yearly);
+        }
+
+        Action::Remove
+    }
+}
+
+fn prune(keep: RetentionCounts, names: &[(String, Option<NaiveDateTime>)]) -> Vec<(&str, Action)> {
+    // partition based on whether it has a timestamp
+    let (ignored, mut to_process): (Vec<_>, Vec<_>) =
+        names.iter().partition(|(_, ts)| ts.is_none());
+
+    let mut actions = Vec::with_capacity(names.len());
+    for (name, _) in ignored {
+        actions.push((name.as_str(), Action::Ignore));
+    }
+
+    let mut bins = RetentionBins::new(keep);
+
+    to_process.sort();
+    for (name, timestamp) in to_process.iter().rev() {
+        // for each of hourly, daily, weekly, monthly, yearly
+        // 1. check to see if it is last in its bucket, do not mark to retain
+        // 2. if so, check if we are to retain more in that category
+        let timestamp = timestamp.unwrap();
+        actions.push((name.as_str(), bins.can_retain(timestamp)));
+    }
+    actions
 }
 
 fn main() -> Result<()> {
     let opts = Opt::from_args();
 
-    if opts.keep_hourly.is_none()
-        && opts.keep_daily.is_none()
-        && opts.keep_weekly.is_none()
-        && opts.keep_monthly.is_none()
-        && opts.keep_yearly.is_none()
-    {
-        Err(anyhow!("No retention rules specified. At least one of --keep-{hourly,daily,weekly,monthly,yearly} must be specified, or all names would be pruned."))?;
+    let keep = RetentionCounts::from_opts(&opts);
+    if keep.is_empty() {
+        return Err(anyhow!("No retention rules specified. At least one of --keep-{hourly,daily,weekly,monthly,yearly} must be specified with non-0 count, or all names would be pruned."));
     }
 
     let log = create_logger(opts.verbose, opts.verbose_timings);
 
     let url = if let Some(uri) = env::var_os("RDEDUP_URI") {
         if env::var_os("RDEDUP_DIR").is_some() {
-            Err(anyhow!(
+            return Err(anyhow!(
                 "Cannot specify both RDEDUP_DIR and RDEDUP_URI at the same time."
-            ))?;
+            ));
         }
         let uri = uri
-            .to_os_string()
             .into_string()
-            .map_err(|_| anyhow!("RDEDUP_DIR='{}' is not valid UTF-8", uri.to_string_lossy()))?;
+            .map_err(|uri| anyhow!("RDEDUP_DIR='{}' is not valid UTF-8", uri.to_string_lossy()))?;
         url::Url::parse(&uri)?
     } else if let Some(dir) = env::var_os("RDEDUP_DIR") {
         url::Url::from_file_path(&dir)
             .map_err(|_| anyhow!("URI parsing error: {}", dir.to_string_lossy()))?
     } else {
-        Err(anyhow!("Repository location not specified"))?
+        return Err(anyhow!("Repository location not specified"));
     };
 
     let repo = rdedup_lib::Repo::open(&url, log)?;
 
-    let parse_timestamp = |n| parse_timestamp(opts.prefix.len(), n);
-
+    let prefix_len = opts.prefix.len();
     let names = repo
         .list_names()?
         .into_iter()
         .filter(|n| n.starts_with(&opts.prefix))
-        .map(parse_timestamp)
+        .map(|n| parse_timestamp(prefix_len, &opts.timestamp_format, n))
         .collect::<Vec<_>>();
 
-    for (timestamp, name) in &names {
-        println!("{}: {:?}", name, timestamp);
+    for ts_name in &names {
+        match ts_name {
+            (name, None) => println!("{} does not contain a parseable timestamp, ignoring", name),
+            (name, Some(timestamp)) => {
+                println!("{}: {:?}", name, timestamp);
+            }
+        }
+    }
+
+    let actions = prune(keep, &names[..]);
+
+    let mut has_removals = false;
+    for (name, action) in actions {
+        println!("{}: {:?}", name, action);
+        if let Action::Remove = action {
+            has_removals = true;
+        }
+    }
+
+    if !opts.skip_gc && has_removals {
+        println!("would GC now");
+    } else {
+        println!("no GC needed");
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn default_timestamps() {
+        let name = "foo-2020-06-27-11-12-13".to_string();
+        let timestamp = chrono::NaiveDate::from_ymd(2020, 6, 27).and_hms(11, 12, 13);
+        let parsed = parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, name.clone());
+        assert_eq!((name, Some(timestamp)), parsed)
+    }
+
+    #[test]
+    fn alternate_timestamps() {
+        let name = "foo-2020-06-27-11-12".to_string();
+        let timestamp = chrono::NaiveDate::from_ymd(2020, 6, 27).and_hms(11, 12, 0);
+        let parsed = parse_timestamp("foo-".len(), "%Y-%m-%d-%H-%M", name.clone());
+        assert_eq!((name, Some(timestamp)), parsed)
+    }
+
+    #[test]
+    fn bad_timestamps() {
+        let names = vec![
+            "".to_string(),
+            "foo-".to_string(),
+            "foo-not-a-timestamp".to_string(),
+            "foo-2020-a6-27-11-12-13".to_string(),
+            "foo-2020-06-27-11-12-93".to_string(),
+        ];
+        for name in names {
+            let parsed = parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, name.clone());
+            assert_eq!((name, None), parsed)
+        }
+    }
+
+    #[test]
+    fn no_retention() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_one_hourly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(1),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_multiple_hourly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            (
+                "foo-2020-06-27-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(2),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_unlimited_hourly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            (
+                "foo-2020-06-27-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                "foo-2020-06-26-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                "foo-2020-06-26-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Unlimited,
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_one_daily() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(1),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_multiple_daily() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-06-26-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(2),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_unlimited_daily() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-06-26-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            (
+                "foo-2020-06-25-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Unlimited,
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_one_weekly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(1),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_multiple_weekly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-06-19-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            ("foo-2020-06-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(2),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_unlimited_weekly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-06-19-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            (
+                "foo-2020-06-11-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Unlimited,
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_one_monthly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-05-19-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-04-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(1),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_multiple_monthly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-05-19-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            ("foo-2020-04-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(2),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_unlimited_monthly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2020-05-19-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            (
+                "foo-2020-04-11-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Unlimited,
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_one_yearly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            ("foo-2019-06-25-11-12-13".to_string(), Action::Remove),
+            ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
+            ("foo-2018-04-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(1),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_multiple_yearly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            (
+                "foo-2019-06-25-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
+            ("foo-2018-04-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(2),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_unlimited_yearly() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            ("foo-2020-06-27-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-27-12-00-00".to_string(), Action::Remove),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
+            ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
+            (
+                "foo-2019-06-25-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2018-04-11-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Unlimited,
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_one_each() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            (
+                "foo-2020-06-27-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            (
+                "foo-2020-06-27-12-00-00".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                "foo-2020-06-26-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            (
+                "foo-2020-06-26-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            ("foo-2019-06-25-11-12-13".to_string(), Action::Remove),
+            ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
+            ("foo-2018-04-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(1),
+            daily: RetentionCount::Count(1),
+            weekly: RetentionCount::Count(1),
+            monthly: RetentionCount::Count(1),
+            yearly: RetentionCount::Count(1),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
+    #[test]
+    fn retain_multiple_each() {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            (
+                "foo-2020-06-27-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                "foo-2020-06-27-12-00-00".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            (
+                "foo-2020-06-27-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                "foo-2020-06-27-10-01-23".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            (
+                "foo-2020-06-26-12-34-56".to_string(),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            (
+                "foo-2020-06-26-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            (
+                "foo-2020-06-21-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            (
+                "foo-2019-06-25-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            (
+                "foo-2019-05-19-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2019-04-11-11-12-13".to_string(), Action::Remove),
+            (
+                "foo-2016-04-11-11-12-13".to_string(),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            ("foo-2015-04-11-11-12-13".to_string(), Action::Remove),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let keep = RetentionCounts {
+            hourly: RetentionCount::Count(2),
+            daily: RetentionCount::Count(2),
+            weekly: RetentionCount::Count(2),
+            monthly: RetentionCount::Count(2),
+            yearly: RetentionCount::Count(2),
+        };
+        assert!(!keep.is_empty());
+
+        let parsed = expected
+            .keys()
+            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
 }
