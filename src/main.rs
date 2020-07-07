@@ -412,6 +412,7 @@ fn main() -> Result<()> {
 
     if !opts.skip_gc {
         print!("Running GC...");
+        std::io::stdout().flush()?;
         repo.gc(opts.gc_grace_secs)?;
         println!("done");
     } else {
