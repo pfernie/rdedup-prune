@@ -83,6 +83,7 @@ struct Opt {
 type Error = anyhow::Error;
 type Result<T> = StdResult<T, Error>;
 
+/// Build an slog::Logger to pass into `rdedup`
 fn create_logger(verbosity: u32, timing_verbosity: u32) -> slog::Logger {
     match (verbosity, timing_verbosity) {
         (0, 0) => slog::Logger::root(slog::Discard, o!()),
@@ -146,6 +147,7 @@ fn parse_timestamp(
 }
 
 #[derive(Debug, PartialEq)]
+/// Description of the rule used when a name is retained
 enum RetainedBy {
     Within(RetainWithin),
     Hourly,
@@ -156,6 +158,7 @@ enum RetainedBy {
 }
 
 #[derive(Debug, PartialEq)]
+/// Prune action determined for a name
 enum Action {
     Retain(RetainedBy),
     Remove,
@@ -172,6 +175,7 @@ enum TimeUnits {
 }
 
 impl TimeUnits {
+    /// Convenience method to convert our `TimeUnits` to a specific `Duration` given a `count`.
     fn duration(&self, count: i64) -> chrono::Duration {
         match self {
             TimeUnits::Hours => chrono::Duration::hours(count),
@@ -184,10 +188,14 @@ impl TimeUnits {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+/// A rule indicating a cutoff time after which all names should be retained.
 struct RetainWithin {
+    /// `count` of `TimeUnits` the interval is for
     count: u32,
-    cutoff: NaiveDateTime,
+    /// The `TimeUnits` of the interval
     time_units: TimeUnits,
+    /// The result of applying the interval to the current time
+    cutoff: NaiveDateTime,
 }
 
 impl std::fmt::Debug for RetainWithin {
@@ -236,10 +244,12 @@ impl std::str::FromStr for RetainWithin {
 }
 
 impl RetainWithin {
+    /// Determine if a given `timestamp` is within the retention interval
     fn is_within(&self, timestamp: NaiveDateTime) -> bool {
         timestamp >= self.cutoff
     }
 
+    /// Construct a new `RetainWithin` for the interval specified by `count` and `time_units`.
     fn new(time_units: TimeUnits, count: u32) -> RetainWithin {
         let cutoff = chrono::offset::Local::now().naive_local() - time_units.duration(count as i64);
         RetainWithin {
@@ -249,34 +259,44 @@ impl RetainWithin {
         }
     }
 
+    /// Construct a new `RetainWithin` for the specified number of hours
     fn hours(count: u32) -> RetainWithin {
         RetainWithin::new(TimeUnits::Hours, count)
     }
 
+    /// Construct a new `RetainWithin` for the specified number of days
     fn days(count: u32) -> RetainWithin {
         RetainWithin::new(TimeUnits::Days, count)
     }
 
+    /// Construct a new `RetainWithin` for the specified number of weeks
     fn weeks(count: u32) -> RetainWithin {
         RetainWithin::new(TimeUnits::Weeks, count)
     }
 
+    /// Construct a new `RetainWithin` for the specified number of months
     fn months(count: u32) -> RetainWithin {
         RetainWithin::new(TimeUnits::Months, count)
     }
 
+    /// Construct a new `RetainWithin` for the specified number of years
     fn years(count: u32) -> RetainWithin {
         RetainWithin::new(TimeUnits::Years, count)
     }
 }
 
 #[derive(Debug)]
+/// Rules specifying a maximum number (`Count`) of names to retain for a bin, or an `Unlimited`
+/// number.
 enum RetentionCount {
     Count(u32),
     Unlimited,
 }
 
 impl RetentionCount {
+    /// Create a `RetentionCount` from `count`. A negative `count` results in an `Unlimited`
+    /// policy, otherwise `count` specifies the maximum number allowed. `0` therefore specifies a
+    /// disabled criteria.
     fn from_i32(count: i32) -> RetentionCount {
         if count < 0 {
             RetentionCount::Unlimited
@@ -285,6 +305,7 @@ impl RetentionCount {
         }
     }
 
+    /// If `Count` variant of `0`, then no names will be retained for these bins.
     fn is_empty(&self) -> bool {
         match self {
             RetentionCount::Count(0) => true,
@@ -293,6 +314,8 @@ impl RetentionCount {
     }
 }
 
+/// The set of retention rules to run against the set of names when evaluating candidates for
+/// pruning.
 struct RetentionRules {
     within: Option<RetainWithin>,
     hourly: RetentionCount,
@@ -319,6 +342,7 @@ impl RetentionRules {
         }
     }
 
+    /// If all the rules in this set disallow any retention, the set is considered empty.
     fn is_empty(&self) -> bool {
         self.within.is_none()
             && self.hourly.is_empty()
@@ -328,10 +352,12 @@ impl RetentionRules {
             && self.yearly.is_empty()
     }
 
+    /// If a `RetainWithin` rule is set, determine if `timestamp` is within that interval.
     fn is_within(&self, timestamp: NaiveDateTime) -> bool {
         self.within.map_or(false, |wi| wi.is_within(timestamp))
     }
 
+    /// Determine if more `Hourly` bin names can be added
     fn allow_more_hourly(&self, count: usize) -> bool {
         match self.hourly {
             RetentionCount::Count(c) => c as usize > count,
@@ -339,6 +365,7 @@ impl RetentionRules {
         }
     }
 
+    /// Determine if more `Daily` bin names can be added
     fn allow_more_daily(&self, count: usize) -> bool {
         match self.daily {
             RetentionCount::Count(c) => c as usize > count,
@@ -346,6 +373,7 @@ impl RetentionRules {
         }
     }
 
+    /// Determine if more `Weekly` bin names can be added
     fn allow_more_weekly(&self, count: usize) -> bool {
         match self.weekly {
             RetentionCount::Count(c) => c as usize > count,
@@ -353,6 +381,7 @@ impl RetentionRules {
         }
     }
 
+    /// Determine if more `Monthly` bin names can be added
     fn allow_more_monthly(&self, count: usize) -> bool {
         match self.monthly {
             RetentionCount::Count(c) => c as usize > count,
@@ -360,6 +389,7 @@ impl RetentionRules {
         }
     }
 
+    /// Determine if more `Yearly` bin names can be added
     fn allow_more_yearly(&self, count: usize) -> bool {
         match self.yearly {
             RetentionCount::Count(c) => c as usize > count,
@@ -368,6 +398,7 @@ impl RetentionRules {
     }
 }
 
+/// The current sets of names that have been retained under a set of `RetentionRules`.
 struct RetentionBins {
     retention_rules: RetentionRules,
     hourly_bins: HashSet<String>,
@@ -389,6 +420,9 @@ impl RetentionBins {
         }
     }
 
+    /// Determine if `timestamp` can be retained via the current `RetentionRules`, either within
+    /// the `RetainWithin` interval or in one of the `Hourly`, `Daily`, `Weekly`, `Monthly`, or
+    /// `Yearly` bins.
     fn can_retain(&mut self, timestamp: NaiveDateTime) -> Action {
         if self.retention_rules.is_within(timestamp) {
             return Action::Retain(RetainedBy::Within(
@@ -450,23 +484,22 @@ impl RetentionBins {
     }
 }
 
+/// Given a set of `RetentionRules`, `keep`, and set of `rdedup` names, determine what actions
+/// should be taken
 fn prune(keep: RetentionRules, names: &[(String, Option<NaiveDateTime>)]) -> Vec<(&str, Action)> {
     // partition based on whether it has a timestamp
     let (ignored, mut to_process): (Vec<_>, Vec<_>) =
         names.iter().partition(|(_, ts)| ts.is_none());
 
     let mut actions = Vec::with_capacity(names.len());
+    // ignored items are handled trivially and do not affect any retention counts.
     for (name, _) in ignored {
         actions.push((name.as_str(), Action::Ignore));
     }
 
     let mut bins = RetentionBins::new(keep);
-
     to_process.sort();
     for (name, timestamp) in to_process.iter().rev() {
-        // for each of hourly, daily, weekly, monthly, yearly
-        // 1. check to see if it is last in its bucket, do not mark to retain
-        // 2. if so, check if we are to retain more in that category
         let timestamp = timestamp.unwrap();
         actions.push((name.as_str(), bins.can_retain(timestamp)));
     }
