@@ -183,11 +183,23 @@ impl TimeUnits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct RetainWithin {
     count: u32,
     cutoff: NaiveDateTime,
     time_units: TimeUnits,
+}
+
+impl std::fmt::Debug for RetainWithin {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(
+            fmt,
+            "{} ({} {:?} ago)",
+            self.cutoff.format(DEFAULT_TIMESTAMP_FORMAT),
+            self.count,
+            self.time_units
+        )
+    }
 }
 
 impl std::str::FromStr for RetainWithin {
