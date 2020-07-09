@@ -161,6 +161,18 @@ enum TimeUnits {
     Years,
 }
 
+impl TimeUnits {
+    fn duration(&self, count: i64) -> chrono::Duration {
+        match self {
+            TimeUnits::Hours => chrono::Duration::hours(count),
+            TimeUnits::Days => chrono::Duration::days(count),
+            TimeUnits::Weeks => chrono::Duration::weeks(count),
+            TimeUnits::Months => chrono::Duration::days(count * 31),
+            TimeUnits::Years => chrono::Duration::days(count * 365),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RetainWithin {
     count: u32,
@@ -206,54 +218,33 @@ impl RetainWithin {
         timestamp >= self.cutoff
     }
 
-    fn hours(count: u32) -> RetainWithin {
-        let cutoff =
-            chrono::offset::Local::now().naive_local() - chrono::Duration::hours(count as i64);
+    fn new(time_units: TimeUnits, count: u32) -> RetainWithin {
+        let cutoff = chrono::offset::Local::now().naive_local() - time_units.duration(count as i64);
         RetainWithin {
             count,
             cutoff,
-            time_units: TimeUnits::Hours,
+            time_units,
         }
+    }
+
+    fn hours(count: u32) -> RetainWithin {
+        RetainWithin::new(TimeUnits::Hours, count)
     }
 
     fn days(count: u32) -> RetainWithin {
-        let cutoff =
-            chrono::offset::Local::now().naive_local() - chrono::Duration::days(count as i64);
-        RetainWithin {
-            count,
-            cutoff,
-            time_units: TimeUnits::Days,
-        }
+        RetainWithin::new(TimeUnits::Days, count)
     }
 
     fn weeks(count: u32) -> RetainWithin {
-        let cutoff =
-            chrono::offset::Local::now().naive_local() - chrono::Duration::weeks(count as i64);
-        RetainWithin {
-            count,
-            cutoff,
-            time_units: TimeUnits::Weeks,
-        }
+        RetainWithin::new(TimeUnits::Weeks, count)
     }
 
     fn months(count: u32) -> RetainWithin {
-        let cutoff =
-            chrono::offset::Local::now().naive_local() - chrono::Duration::days(count as i64 * 31);
-        RetainWithin {
-            count,
-            cutoff,
-            time_units: TimeUnits::Months,
-        }
+        RetainWithin::new(TimeUnits::Months, count)
     }
 
     fn years(count: u32) -> RetainWithin {
-        let cutoff =
-            chrono::offset::Local::now().naive_local() - chrono::Duration::days(count as i64 * 365);
-        RetainWithin {
-            count,
-            cutoff,
-            time_units: TimeUnits::Years,
-        }
+        RetainWithin::new(TimeUnits::Years, count)
     }
 }
 
@@ -552,6 +543,8 @@ fn main() -> Result<()> {
 mod test {
     use std::collections::HashMap;
 
+    use chrono::{Duration, NaiveDate, NaiveDateTime, Timelike};
+
     use super::*;
 
     #[test]
@@ -582,7 +575,7 @@ mod test {
     #[test]
     fn default_timestamps() {
         let name = "foo-2020-06-27-11-12-13".to_string();
-        let timestamp = chrono::NaiveDate::from_ymd(2020, 6, 27).and_hms(11, 12, 13);
+        let timestamp = NaiveDate::from_ymd(2020, 6, 27).and_hms(11, 12, 13);
         let parsed = parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, name.clone());
         assert_eq!((name, Some(timestamp)), parsed)
     }
@@ -590,7 +583,7 @@ mod test {
     #[test]
     fn alternate_timestamps() {
         let name = "foo-2020-06-27-11-12".to_string();
-        let timestamp = chrono::NaiveDate::from_ymd(2020, 6, 27).and_hms(11, 12, 0);
+        let timestamp = NaiveDate::from_ymd(2020, 6, 27).and_hms(11, 12, 0);
         let parsed = parse_timestamp("foo-".len(), "%Y-%m-%d-%H-%M", name.clone());
         assert_eq!((name, Some(timestamp)), parsed)
     }
@@ -619,8 +612,16 @@ mod test {
         let actions = prune(keep, &parsed[..]);
         let actions = actions.into_iter().collect::<HashMap<_, _>>();
 
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        let len = expected.len();
+        for (i, (n, expected)) in expected.into_iter().enumerate() {
+            assert_eq!(
+                actions[n.as_str()],
+                expected,
+                "case {}/{}: {}",
+                i + 1,
+                len,
+                n
+            );
         }
     }
 
@@ -1226,17 +1227,227 @@ mod test {
             yearly: RetentionCount::Count(2),
         };
         assert!(!keep.is_empty());
+        test_rules(keep, expected);
+    }
 
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
+    fn generate_timestamp_name(prefix: &str, timestamp: NaiveDateTime) -> String {
+        format!("{}{}", prefix, timestamp.format(DEFAULT_TIMESTAMP_FORMAT))
+    }
 
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+    trait NaiveDateTimeExt {
+        fn at_min(&self, min: u32) -> NaiveDateTime;
+        fn add_mins(&self, mins: i64) -> NaiveDateTime;
+        fn add_hours(&self, hours: i64) -> NaiveDateTime;
+        fn add_days(&self, days: i64) -> NaiveDateTime;
+        fn add_weeks(&self, weeks: i64) -> NaiveDateTime;
+        fn add_months(&self, months: i64) -> NaiveDateTime;
+        fn add_years(&self, years: i64) -> NaiveDateTime;
+    }
 
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
+    impl NaiveDateTimeExt for NaiveDateTime {
+        fn at_min(&self, min: u32) -> NaiveDateTime {
+            self.date().and_hms(self.hour(), min, self.second())
         }
+        fn add_mins(&self, mins: i64) -> NaiveDateTime {
+            *self + Duration::minutes(mins)
+        }
+        // Implemented in terms of `TimeUnits` to maintain consistent logic for e.g. months = 31
+        // days.
+        fn add_hours(&self, hours: i64) -> NaiveDateTime {
+            *self + TimeUnits::Hours.duration(hours)
+        }
+        fn add_days(&self, days: i64) -> NaiveDateTime {
+            *self + TimeUnits::Days.duration(days)
+        }
+        fn add_weeks(&self, weeks: i64) -> NaiveDateTime {
+            *self + TimeUnits::Weeks.duration(weeks)
+        }
+        fn add_months(&self, months: i64) -> NaiveDateTime {
+            *self + TimeUnits::Months.duration(months)
+        }
+        fn add_years(&self, years: i64) -> NaiveDateTime {
+            *self + TimeUnits::Years.duration(years)
+        }
+    }
+
+    fn test_within_only(within: RetainWithin) {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_mins(1)),
+                Action::Retain(RetainedBy::Within(within)),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_mins(-1)),
+                Action::Remove,
+            ),
+        ];
+
+        let keep = RetentionRules {
+            within: Some(within),
+            hourly: RetentionCount::Count(0),
+            daily: RetentionCount::Count(0),
+            weekly: RetentionCount::Count(0),
+            monthly: RetentionCount::Count(0),
+            yearly: RetentionCount::Count(0),
+        };
+        assert!(!keep.is_empty());
+        test_rules(keep, expected);
+    }
+
+    fn retain_from(time_units: TimeUnits, count: u32) -> RetainWithin {
+        let cutoff = NaiveDate::from_ymd(2019, 6, 30).and_hms(18, 30, 30)
+            - time_units.duration(count as i64);
+        RetainWithin {
+            cutoff,
+            time_units,
+            count,
+        }
+    }
+
+    #[test]
+    fn retain_within_hours_only() {
+        test_within_only(retain_from(TimeUnits::Hours, 2));
+    }
+
+    #[test]
+    fn retain_within_days_only() {
+        test_within_only(retain_from(TimeUnits::Days, 2));
+    }
+
+    #[test]
+    fn retain_within_weeks_only() {
+        test_within_only(retain_from(TimeUnits::Weeks, 2));
+    }
+
+    #[test]
+    fn retain_within_months_only() {
+        test_within_only(retain_from(TimeUnits::Months, 2));
+    }
+
+    #[test]
+    fn retain_within_years_only() {
+        test_within_only(retain_from(TimeUnits::Years, 2));
+    }
+
+    fn test_within(within: RetainWithin) {
+        let expected = vec![
+            ("foo-not-a-timestamp".to_string(), Action::Ignore),
+            ("foo-2020-_6-27-11-12-13".to_string(), Action::Ignore),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_mins(1)),
+                Action::Retain(RetainedBy::Within(within)),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-2).at_min(30)),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-2).at_min(29)),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-3).at_min(30)),
+                Action::Retain(RetainedBy::Hourly),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-3).at_min(29)),
+                Action::Retain(RetainedBy::Weekly),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-3).at_min(28)),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-3).at_min(27)),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_hours(-3).at_min(26)),
+                Action::Remove,
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_days(-1).at_min(30)),
+                Action::Retain(RetainedBy::Daily),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_days(-1).at_min(29)),
+                // The date math works out such that this roll back falls into a new week for the
+                // Monthly case.
+                if TimeUnits::Months == within.time_units {
+                    Action::Retain(RetainedBy::Weekly)
+                } else {
+                    Action::Remove
+                },
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_weeks(-1).at_min(30)),
+                if TimeUnits::Months != within.time_units {
+                    Action::Retain(RetainedBy::Weekly)
+                } else {
+                    Action::Remove
+                },
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_weeks(-2).at_min(30)),
+                Action::Remove,
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_months(-1).at_min(30)),
+                Action::Retain(RetainedBy::Monthly),
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_months(-2).at_min(30)),
+                Action::Remove,
+            ),
+            (
+                generate_timestamp_name("foo-", within.cutoff.add_years(-1).at_min(30)),
+                Action::Retain(RetainedBy::Yearly),
+            ),
+            (
+                generate_timestamp_name(
+                    "foo-",
+                    within.cutoff.add_years(-1).at_min(30).add_mins(-1),
+                ),
+                Action::Remove,
+            ),
+        ];
+
+        let keep = RetentionRules {
+            within: Some(within),
+            hourly: RetentionCount::Count(2),
+            daily: RetentionCount::Count(2),
+            weekly: RetentionCount::Count(2),
+            monthly: RetentionCount::Count(2),
+            yearly: RetentionCount::Count(2),
+        };
+        assert!(!keep.is_empty());
+        test_rules(keep, expected);
+    }
+
+    #[test]
+    fn retain_within_hours() {
+        test_within(retain_from(TimeUnits::Hours, 2));
+    }
+
+    #[test]
+    fn retain_within_days() {
+        test_within(retain_from(TimeUnits::Days, 2));
+    }
+
+    #[test]
+    fn retain_within_weeks() {
+        test_within(retain_from(TimeUnits::Weeks, 2));
+    }
+
+    #[test]
+    fn retain_within_months() {
+        test_within(retain_from(TimeUnits::Months, 2));
+    }
+
+    #[test]
+    fn retain_within_years() {
+        test_within(retain_from(TimeUnits::Years, 2));
     }
 }
