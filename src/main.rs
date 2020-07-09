@@ -43,6 +43,9 @@ struct Opt {
     #[structopt(short = "n", long = "dry-run")]
     /// Dry-run only; do not prune any names
     dry_run: bool,
+    #[structopt(long = "keep-within")]
+    /// Keep names within the specified interval
+    keep_within: Option<RetainWithin>,
     #[structopt(short = "H", long = "keep-hourly", default_value = "0")]
     /// Number of hourly archives to keep
     keep_hourly: i32,
@@ -130,6 +133,7 @@ fn parse_timestamp(
 
 #[derive(Debug, PartialEq)]
 enum RetainedBy {
+    Within(RetainWithin),
     Hourly,
     Daily,
     Weekly,
@@ -142,6 +146,111 @@ enum Action {
     Retain(RetainedBy),
     Remove,
     Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TimeUnits {
+    Hours,
+    Days,
+    Weeks,
+    Months,
+    Years,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RetainWithin {
+    count: u32,
+    cutoff: NaiveDateTime,
+    time_units: TimeUnits,
+}
+
+impl std::str::FromStr for RetainWithin {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(anyhow!("Empty --keep-within value specified"));
+        }
+
+        let count = s[0..s.len() - 1]
+            .parse::<u32>()
+            .map_err(|e| anyhow!("Failed to parse --keep-within value '{}': {}", s, e))?;
+
+        if count == 0 {
+            return Err(anyhow!("--keep-within value of 0 specified"));
+        }
+
+        if s.ends_with("H") || s.ends_with("h") {
+            Ok(RetainWithin::hours(count))
+        } else if s.ends_with("D") || s.ends_with("d") {
+            Ok(RetainWithin::days(count))
+        } else if s.ends_with("W") || s.ends_with("w") {
+            Ok(RetainWithin::weeks(count))
+        } else if s.ends_with("M") || s.ends_with("m") {
+            Ok(RetainWithin::months(count))
+        } else if s.ends_with("Y") || s.ends_with("y") {
+            Ok(RetainWithin::years(count))
+        } else {
+            Err(anyhow!("Invalid --keep-within time unit '{}'; must be one of h(our), d(ay), w(eek), m(onth), or y(ear).", &s[s.len()-1..]))
+        }
+    }
+}
+
+impl RetainWithin {
+    fn is_within(&self, timestamp: NaiveDateTime) -> bool {
+        timestamp >= self.cutoff
+    }
+
+    fn hours(count: u32) -> RetainWithin {
+        let cutoff =
+            chrono::offset::Local::now().naive_local() - chrono::Duration::hours(count as i64);
+        RetainWithin {
+            count,
+            cutoff,
+            time_units: TimeUnits::Hours,
+        }
+    }
+
+    fn days(count: u32) -> RetainWithin {
+        let cutoff =
+            chrono::offset::Local::now().naive_local() - chrono::Duration::days(count as i64);
+        RetainWithin {
+            count,
+            cutoff,
+            time_units: TimeUnits::Days,
+        }
+    }
+
+    fn weeks(count: u32) -> RetainWithin {
+        let cutoff =
+            chrono::offset::Local::now().naive_local() - chrono::Duration::weeks(count as i64);
+        RetainWithin {
+            count,
+            cutoff,
+            time_units: TimeUnits::Weeks,
+        }
+    }
+
+    fn months(count: u32) -> RetainWithin {
+        let cutoff =
+            chrono::offset::Local::now().naive_local() - chrono::Duration::days(count as i64 * 31);
+        RetainWithin {
+            count,
+            cutoff,
+            time_units: TimeUnits::Months,
+        }
+    }
+
+    fn years(count: u32) -> RetainWithin {
+        let cutoff =
+            chrono::offset::Local::now().naive_local() - chrono::Duration::days(count as i64 * 365);
+        RetainWithin {
+            count,
+            cutoff,
+            time_units: TimeUnits::Years,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -167,7 +276,8 @@ impl RetentionCount {
     }
 }
 
-struct RetentionCounts {
+struct RetentionRules {
+    within: Option<RetainWithin>,
     hourly: RetentionCount,
     daily: RetentionCount,
     weekly: RetentionCount,
@@ -175,14 +285,15 @@ struct RetentionCounts {
     yearly: RetentionCount,
 }
 
-impl RetentionCounts {
-    fn from_opts(opts: &Opt) -> RetentionCounts {
+impl RetentionRules {
+    fn from_opts(opts: &Opt) -> RetentionRules {
         let hourly = RetentionCount::from_i32(opts.keep_hourly);
         let daily = RetentionCount::from_i32(opts.keep_daily);
         let weekly = RetentionCount::from_i32(opts.keep_weekly);
         let monthly = RetentionCount::from_i32(opts.keep_monthly);
         let yearly = RetentionCount::from_i32(opts.keep_yearly);
-        RetentionCounts {
+        RetentionRules {
+            within: None,
             hourly,
             daily,
             weekly,
@@ -192,11 +303,16 @@ impl RetentionCounts {
     }
 
     fn is_empty(&self) -> bool {
-        self.hourly.is_empty()
+        self.within.is_none()
+            && self.hourly.is_empty()
             && self.daily.is_empty()
             && self.weekly.is_empty()
             && self.monthly.is_empty()
             && self.yearly.is_empty()
+    }
+
+    fn is_within(&self, timestamp: NaiveDateTime) -> bool {
+        self.within.map_or(false, |wi| wi.is_within(timestamp))
     }
 
     fn allow_more_hourly(&self, count: usize) -> bool {
@@ -236,7 +352,7 @@ impl RetentionCounts {
 }
 
 struct RetentionBins {
-    retention_counts: RetentionCounts,
+    retention_rules: RetentionRules,
     hourly_bins: HashSet<String>,
     daily_bins: HashSet<String>,
     weekly_bins: HashSet<String>,
@@ -245,9 +361,9 @@ struct RetentionBins {
 }
 
 impl RetentionBins {
-    fn new(retention_counts: RetentionCounts) -> RetentionBins {
+    fn new(retention_rules: RetentionRules) -> RetentionBins {
         RetentionBins {
-            retention_counts,
+            retention_rules,
             hourly_bins: HashSet::new(),
             daily_bins: HashSet::new(),
             weekly_bins: HashSet::new(),
@@ -257,9 +373,17 @@ impl RetentionBins {
     }
 
     fn can_retain(&mut self, timestamp: NaiveDateTime) -> Action {
+        if self.retention_rules.is_within(timestamp) {
+            return Action::Retain(RetainedBy::Within(
+                self.retention_rules
+                    .within
+                    .expect("Must be `Some` for `is_within` to return true"),
+            ));
+        }
+
         let hourly_key = timestamp.format("%Y%m%d%H").to_string();
         if self
-            .retention_counts
+            .retention_rules
             .allow_more_hourly(self.hourly_bins.len())
             && !self.hourly_bins.contains(&hourly_key)
         {
@@ -268,9 +392,7 @@ impl RetentionBins {
         }
 
         let daily_key = timestamp.format("%Y%m%d").to_string();
-        if self
-            .retention_counts
-            .allow_more_daily(self.daily_bins.len())
+        if self.retention_rules.allow_more_daily(self.daily_bins.len())
             && !self.daily_bins.contains(&daily_key)
         {
             self.daily_bins.insert(daily_key);
@@ -279,7 +401,7 @@ impl RetentionBins {
 
         let weekly_key = timestamp.format("%Y%W").to_string();
         if self
-            .retention_counts
+            .retention_rules
             .allow_more_weekly(self.weekly_bins.len())
             && !self.weekly_bins.contains(&weekly_key)
         {
@@ -289,7 +411,7 @@ impl RetentionBins {
 
         let monthly_key = timestamp.format("%Y%m").to_string();
         if self
-            .retention_counts
+            .retention_rules
             .allow_more_monthly(self.monthly_bins.len())
             && !self.monthly_bins.contains(&monthly_key)
         {
@@ -299,7 +421,7 @@ impl RetentionBins {
 
         let yearly_key = timestamp.year();
         if self
-            .retention_counts
+            .retention_rules
             .allow_more_yearly(self.yearly_bins.len())
             && !self.yearly_bins.contains(&yearly_key)
         {
@@ -311,7 +433,7 @@ impl RetentionBins {
     }
 }
 
-fn prune(keep: RetentionCounts, names: &[(String, Option<NaiveDateTime>)]) -> Vec<(&str, Action)> {
+fn prune(keep: RetentionRules, names: &[(String, Option<NaiveDateTime>)]) -> Vec<(&str, Action)> {
     // partition based on whether it has a timestamp
     let (ignored, mut to_process): (Vec<_>, Vec<_>) =
         names.iter().partition(|(_, ts)| ts.is_none());
@@ -337,7 +459,7 @@ fn prune(keep: RetentionCounts, names: &[(String, Option<NaiveDateTime>)]) -> Ve
 fn main() -> Result<()> {
     let opts = Opt::from_args();
 
-    let keep = RetentionCounts::from_opts(&opts);
+    let keep = RetentionRules::from_opts(&opts);
     if keep.is_empty() {
         return Err(anyhow!("No retention rules specified. At least one of --keep-{hourly,daily,weekly,monthly,yearly} must be specified with non-0 count, or all names would be pruned."));
     }
@@ -472,7 +594,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -510,7 +633,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(1),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -552,7 +676,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(2),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -600,7 +725,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Unlimited,
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -639,7 +765,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(1),
             weekly: RetentionCount::Count(0),
@@ -682,7 +809,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(2),
             weekly: RetentionCount::Count(0),
@@ -728,7 +856,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Unlimited,
             weekly: RetentionCount::Count(0),
@@ -768,7 +897,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(1),
@@ -813,7 +943,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(2),
@@ -861,7 +992,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Unlimited,
@@ -903,7 +1035,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -948,7 +1081,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -996,7 +1130,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -1038,7 +1173,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -1083,7 +1219,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -1131,7 +1268,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(0),
             daily: RetentionCount::Count(0),
             weekly: RetentionCount::Count(0),
@@ -1185,7 +1323,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(1),
             daily: RetentionCount::Count(1),
             weekly: RetentionCount::Count(1),
@@ -1258,7 +1397,8 @@ mod test {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        let keep = RetentionCounts {
+        let keep = RetentionRules {
+            within: None,
             hourly: RetentionCount::Count(2),
             daily: RetentionCount::Count(2),
             weekly: RetentionCount::Count(2),
