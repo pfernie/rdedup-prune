@@ -16,6 +16,9 @@ const DEFAULT_TIMESTAMP_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
 /// Specifying a negative value for any --keep-* directive will result in an unlimited number for
 /// that category. Specifying 0 disables the directive (the same as not specifying the directive at
 /// all).
+///
+/// The --keep-within rule specifies an interval in which to keep all names, which do not count
+/// towards any counts for the --keep-{hourly,daily,weekly,monthly,yearly} rules.
 struct Opt {
     #[structopt(parse(from_occurrences), short = "v", long = "verbose")]
     /// Increase debugging level for general messages
@@ -44,7 +47,8 @@ struct Opt {
     /// Dry-run only; do not prune any names
     dry_run: bool,
     #[structopt(long = "keep-within")]
-    /// Keep names within the specified interval
+    /// Keep names within the specified interval. Intervals may be specified as <count><unit>,
+    /// where <unit> is one of: h(ours), d(ays), w(eeks), m(onths, 31 days), y(ears, 365 days)
     keep_within: Option<RetainWithin>,
     #[structopt(short = "H", long = "keep-hourly", default_value = "0")]
     /// Number of hourly archives to keep
@@ -293,7 +297,7 @@ impl RetentionRules {
         let monthly = RetentionCount::from_i32(opts.keep_monthly);
         let yearly = RetentionCount::from_i32(opts.keep_yearly);
         RetentionRules {
-            within: None,
+            within: opts.keep_within,
             hourly,
             daily,
             weekly,
@@ -461,7 +465,7 @@ fn main() -> Result<()> {
 
     let keep = RetentionRules::from_opts(&opts);
     if keep.is_empty() {
-        return Err(anyhow!("No retention rules specified. At least one of --keep-{hourly,daily,weekly,monthly,yearly} must be specified with non-0 count, or all names would be pruned."));
+        return Err(anyhow!("No retention rules specified. At least one of --keep-{hourly,daily,weekly,monthly,yearly,within} must be specified with non-0 count, or all names would be pruned."));
     }
 
     let log = create_logger(opts.verbose, opts.verbose_timings);
@@ -549,6 +553,31 @@ mod test {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn parse_retain_within() {
+        assert!("0".parse::<RetainWithin>().is_err());
+        assert!("1z".parse::<RetainWithin>().is_err());
+        assert!("z".parse::<RetainWithin>().is_err());
+        assert!("".parse::<RetainWithin>().is_err());
+        for (units, mnemonics) in &[
+            (TimeUnits::Hours, ["h", "H"]),
+            (TimeUnits::Days, ["d", "D"]),
+            (TimeUnits::Weeks, ["w", "W"]),
+            (TimeUnits::Months, ["m", "M"]),
+            (TimeUnits::Years, ["y", "Y"]),
+        ] {
+            for mnemonic in mnemonics {
+                assert!(format!("0{}", mnemonic).parse::<RetainWithin>().is_err());
+                assert!(format!("-1{}", mnemonic).parse::<RetainWithin>().is_err());
+                assert!(format!("1.23{}", mnemonic).parse::<RetainWithin>().is_err());
+                let good_parse = format!("1{}", mnemonic).parse::<RetainWithin>();
+                let good_parse = good_parse.expect("should have parsed successfully");
+                assert_eq!(good_parse.time_units, *units);
+                assert_eq!(good_parse.count, 1);
+            }
+        }
+    }
 
     #[test]
     fn default_timestamps() {
