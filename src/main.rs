@@ -610,6 +610,20 @@ mod test {
         }
     }
 
+    fn test_rules(keep: RetentionRules, expected: Vec<(String, Action)>) {
+        let parsed = expected
+            .iter()
+            .map(|(n, _)| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
+            .collect::<Vec<_>>();
+
+        let actions = prune(keep, &parsed[..]);
+        let actions = actions.into_iter().collect::<HashMap<_, _>>();
+
+        for (n, expected) in expected {
+            assert_eq!(actions[n.as_str()], expected, "{}", n);
+        }
+    }
+
     #[test]
     fn no_retention() {
         let expected = vec![
@@ -619,9 +633,7 @@ mod test {
             ("foo-2020-06-27-12-34-56".to_string(), Action::Remove),
             ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
             ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -632,18 +644,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -658,9 +659,7 @@ mod test {
             ),
             ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
             ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -671,18 +670,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -701,9 +689,7 @@ mod test {
             ),
             ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
             ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -714,18 +700,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -750,9 +725,7 @@ mod test {
                 "foo-2020-06-26-12-34-56".to_string(),
                 Action::Retain(RetainedBy::Hourly),
             ),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -763,18 +736,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -790,9 +752,7 @@ mod test {
             ),
             ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
             ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -803,18 +763,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -834,9 +783,7 @@ mod test {
                 Action::Retain(RetainedBy::Daily),
             ),
             ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -847,18 +794,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -881,9 +817,7 @@ mod test {
                 "foo-2020-06-25-11-12-13".to_string(),
                 Action::Retain(RetainedBy::Daily),
             ),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -894,18 +828,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -922,9 +845,7 @@ mod test {
             ("foo-2020-06-26-11-12-13".to_string(), Action::Remove),
             ("foo-2020-06-26-12-34-56".to_string(), Action::Remove),
             ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -935,18 +856,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -968,9 +878,7 @@ mod test {
                 Action::Retain(RetainedBy::Weekly),
             ),
             ("foo-2020-06-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -981,18 +889,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1017,9 +914,7 @@ mod test {
                 "foo-2020-06-11-11-12-13".to_string(),
                 Action::Retain(RetainedBy::Weekly),
             ),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1030,18 +925,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1060,9 +944,7 @@ mod test {
             ("foo-2020-06-25-11-12-13".to_string(), Action::Remove),
             ("foo-2020-05-19-11-12-13".to_string(), Action::Remove),
             ("foo-2020-04-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1073,18 +955,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1106,9 +977,7 @@ mod test {
                 Action::Retain(RetainedBy::Monthly),
             ),
             ("foo-2020-04-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1119,18 +988,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1155,9 +1013,7 @@ mod test {
                 "foo-2020-04-11-11-12-13".to_string(),
                 Action::Retain(RetainedBy::Monthly),
             ),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1168,18 +1024,7 @@ mod test {
             yearly: RetentionCount::Count(0),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1198,9 +1043,7 @@ mod test {
             ("foo-2019-06-25-11-12-13".to_string(), Action::Remove),
             ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
             ("foo-2018-04-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1211,18 +1054,7 @@ mod test {
             yearly: RetentionCount::Count(1),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1244,9 +1076,7 @@ mod test {
             ),
             ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
             ("foo-2018-04-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1257,18 +1087,7 @@ mod test {
             yearly: RetentionCount::Count(2),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1293,9 +1112,7 @@ mod test {
                 "foo-2018-04-11-11-12-13".to_string(),
                 Action::Retain(RetainedBy::Yearly),
             ),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1306,18 +1123,7 @@ mod test {
             yearly: RetentionCount::Unlimited,
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1348,9 +1154,7 @@ mod test {
             ("foo-2019-06-25-11-12-13".to_string(), Action::Remove),
             ("foo-2019-05-19-11-12-13".to_string(), Action::Remove),
             ("foo-2018-04-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
@@ -1361,18 +1165,7 @@ mod test {
             yearly: RetentionCount::Count(1),
         };
         assert!(!keep.is_empty());
-
-        let parsed = expected
-            .keys()
-            .map(|n| parse_timestamp("foo-".len(), DEFAULT_TIMESTAMP_FORMAT, n.clone()))
-            .collect::<Vec<_>>();
-
-        let actions = prune(keep, &parsed[..]);
-        let actions = actions.into_iter().collect::<HashMap<_, _>>();
-
-        for (n, expected) in expected {
-            assert_eq!(actions[n.as_str()], expected, "{}", n);
-        }
+        test_rules(keep, expected);
     }
 
     #[test]
@@ -1422,9 +1215,7 @@ mod test {
                 Action::Retain(RetainedBy::Yearly),
             ),
             ("foo-2015-04-11-11-12-13".to_string(), Action::Remove),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        ];
 
         let keep = RetentionRules {
             within: None,
