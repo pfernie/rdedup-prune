@@ -3,6 +3,8 @@ authors = ["Patrick Fernie <patrick.fernie@gmail.com>"]
 edition = "2018"
 name = "rdedup-prune"
 version = "0.1.0"
+license = "MPL-2.0"
+description = "implementation of a `prune` command for `rdedup`, following the behavior of `attic`"
 [dependencies]
 anyhow = "1.0.32"
 chrono = "0.4.13"
