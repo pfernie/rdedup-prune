@@ -5,6 +5,11 @@ name = "rdedup-prune"
 version = "0.1.0"
 license = "MPL-2.0"
 description = "implementation of a `prune` command for `rdedup`, following the behavior of `attic`"
+documentation = "https://docs.rs/rdedup-prune"
+homepage = "https://github.com/pfernie/rdedup-prune"
+repository = "https://github.com/pfernie/rdedup-prune"
+readme = "README.md"
+
 [dependencies]
 anyhow = "1.0.32"
 chrono = "0.4.13"
